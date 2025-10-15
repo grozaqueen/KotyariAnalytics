@@ -30,7 +30,7 @@ def cluster_messages():
     try:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT id, text, section
+                SELECT id, text_clean, section
                 FROM public.topics
             """)
             rows = cur.fetchall()
@@ -68,7 +68,6 @@ def cluster_messages():
         conn.close()
 
 
-
 def perform_clustering(data, method='umap_hdbscan', auto_eps=True, k_neighbors=5):
     embeddings = np.array([item['embedding'] for item in data])
 
@@ -76,58 +75,60 @@ def perform_clustering(data, method='umap_hdbscan', auto_eps=True, k_neighbors=5
 
     if method == 'dbscan':
         if auto_eps:
-            nn = NearestNeighbors(n_neighbors=k_neighbors, metric="cosine")
+            nn = NearestNeighbors(n_neighbors=3, metric="cosine")
             nn.fit(embeddings_normalized)
             distances, _ = nn.kneighbors(embeddings_normalized)
-            k_distances = np.sort(distances[:, k_neighbors - 1])
-            plt.plot(k_distances); plt.ylabel(f"{k_neighbors}-NN distance")
+            k_distances = np.sort(distances[:, 3 - 1])
+            plt.plot(k_distances); plt.ylabel("3-NN distance")
             plt.xlabel("Points sorted by distance"); plt.title("Используй излом графика как eps")
             plt.show()
-            eps_value = float(np.median(k_distances))
+            eps_value = float(np.median(k_distances) * 0.85)
         else:
-            eps_value = 0.3
-
-        clustering = DBSCAN(eps=eps_value, min_samples=10, metric='cosine')
+            eps_value = 0.25
+        clustering = DBSCAN(eps=eps_value, min_samples=5, metric='cosine')
         labels = clustering.fit_predict(embeddings_normalized)
 
     elif method == 'kmeans':
-        kmeans = KMeans(n_clusters=5, random_state=42, n_init=20)
+        kmeans = KMeans(n_clusters=12, random_state=42, n_init=30)
         labels = kmeans.fit_predict(embeddings_normalized)
 
     elif method == 'hdbscan':
         clusterer = hdbscan.HDBSCAN(
-            min_cluster_size=8,
-            min_samples=2,
+            min_cluster_size=4,
+            min_samples=1,
             metric='cosine',
             cluster_selection_method='leaf',
-            cluster_selection_epsilon=0.05,
+            cluster_selection_epsilon=0.02,
             prediction_data=True
         )
         labels = clusterer.fit_predict(embeddings_normalized)
 
     elif method == 'umap_hdbscan':
         reducer_15 = umap.UMAP(
-            n_neighbors=10,
+            n_neighbors=5,
             min_dist=0.0,
-            n_components=15,
+            n_components=55,
             metric='cosine',
             random_state=42
         )
         emb_umap = reducer_15.fit_transform(embeddings_normalized)
 
         clusterer = hdbscan.HDBSCAN(
-            min_cluster_size=6,
-            min_samples=2,
+            min_cluster_size=4,
+            min_samples=1,
             metric='euclidean',
             cluster_selection_method='leaf',
-            cluster_selection_epsilon=0.03,
+            cluster_selection_epsilon=0.01,
             prediction_data=True
         )
         labels = clusterer.fit_predict(emb_umap)
 
         reducer_2 = umap.UMAP(
-            n_neighbors=10, min_dist=0.0, n_components=2,
-            metric='cosine', random_state=42
+            n_neighbors=3,
+            min_dist=0.0,
+            n_components=2,
+            metric='cosine',
+            random_state=42
         )
         emb_2d = reducer_2.fit_transform(embeddings_normalized)
         for i, item in enumerate(data):
@@ -137,6 +138,7 @@ def perform_clustering(data, method='umap_hdbscan', auto_eps=True, k_neighbors=5
         raise ValueError("Метод должен быть 'dbscan', 'kmeans', 'hdbscan' или 'umap_hdbscan'")
 
     return labels
+
 
 
 def find_optimal_eps(embeddings, k=2):
