@@ -36,7 +36,70 @@ def _print_table(rows: list[dict[str, Any]], cols: list[str], title: str):
         print(" | ".join(str(r.get(c, "")).ljust(widths[c]) for c in cols))
     print("=" * len(header))
 
-def select_candidate_clusters(q_emb: np.ndarray, topk: int = 8, section: str | None = None) -> list[dict[str, Any]]:
+def _rerank_by_posts(cur, q_vec_sql: str, section: str | None, cluster_ids: list[int],
+                     topk_posts: int = 50, tau: float | None = None) -> dict[int, dict[str, Any]]:
+    if not cluster_ids:
+        return {}
+
+    sql = """
+    WITH sims AS (
+      SELECT
+        mc.cluster_id,
+        1.0 - (pe.emb <#> %s::vector) AS sim,
+        ROW_NUMBER() OVER (
+          PARTITION BY mc.cluster_id
+          ORDER BY pe.emb <#> %s::vector
+        ) AS rn,
+        COUNT(*) OVER (PARTITION BY mc.cluster_id) AS cluster_size
+      FROM public.message_clusters mc
+      JOIN public.post_embeddings pe
+        ON pe.post_id = mc.topic_id
+      WHERE mc.cluster_id = ANY(%s)
+        AND (%s IS NULL OR mc.section = %s)
+    )
+    SELECT
+      cluster_id,
+      MAX(cluster_size) AS cluster_size,
+      AVG(sim) FILTER (WHERE rn <= %s) AS post_topk_mean_sim,
+      -- Если tau = NULL, вернём NULL в hits/dens (мягко отключаем пороговую метрику)
+      SUM(CASE WHEN %s IS NULL THEN NULL ELSE (sim >= %s)::int END) AS post_hits_at_tau,
+      (SUM(CASE WHEN %s IS NULL THEN NULL ELSE (sim >= %s)::int END))::float
+        / NULLIF(MAX(cluster_size), 0) AS post_dens_at_tau
+    FROM sims
+    GROUP BY cluster_id;
+    """
+    # tau используется 3 раза в запросе
+    params = (
+        q_vec_sql, q_vec_sql,
+        cluster_ids,
+        section, section,
+        topk_posts,
+        tau, tau,
+        tau, tau,
+    )
+    cur.execute(sql, params)
+    cols = [d.name for d in cur.description]
+    rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+    out: dict[int, dict[str, Any]] = {int(r["cluster_id"]): r for r in rows}
+
+    # Отладочный вывод таблицы
+    _print_table(
+        rows,
+        ["cluster_id", "cluster_size", "post_topk_mean_sim", "post_hits_at_tau", "post_dens_at_tau"],
+        title=f"Post-level metrics (K={topk_posts}, tau={'NA' if tau is None else tau})"
+    )
+    return out
+
+def select_candidate_clusters(
+    q_emb: np.ndarray,
+    topk: int = 8,
+    section: str | None = None,
+
+    posts_topk: int = 50,
+    posts_tau: float | None = None,
+    reorder_by_posts: bool = True,
+) -> list[dict[str, Any]]:
+
     q = _vec_sql(q_emb)
     with get_conn() as conn, conn.cursor() as cur:
         mv_ready = _is_matview_populated(conn, "public", "mv_cluster_trend_score")
@@ -124,8 +187,48 @@ def select_candidate_clusters(q_emb: np.ndarray, topk: int = 8, section: str | N
         _print_table(
             rows,
             ["section", "cluster_id", "sim_centroid", "sim_title", "trend_score", "final_score", "topic"],
-            title=f"Candidate clusters (top {min(3, len(rows))})"
+            title=f"Candidate clusters (stage 1, top {min(3, len(rows))})"
         )
+
+        if rows:
+            cluster_ids = [int(r["cluster_id"]) for r in rows]
+            post_metrics = _rerank_by_posts(
+                cur, q, section, cluster_ids,
+                topk_posts=posts_topk,
+                tau=posts_tau
+            )
+            for r in rows:
+                m = post_metrics.get(int(r["cluster_id"])) or {}
+                r["post_topk_mean_sim"] = m.get("post_topk_mean_sim")
+                r["post_hits_at_tau"]   = m.get("post_hits_at_tau")
+                r["post_dens_at_tau"]   = m.get("post_dens_at_tau")
+                r["cluster_size"]       = m.get("cluster_size")
+
+            _print_table(
+                rows,
+                ["section", "cluster_id", "cluster_size", "post_topk_mean_sim", "post_hits_at_tau", "post_dens_at_tau"],
+                title="Candidates enriched with post-level metrics (stage 2)"
+            )
+
+            if reorder_by_posts:
+                def _sort_key(r):
+                    dens = r.get("post_dens_at_tau")
+                    mean = r.get("post_topk_mean_sim")
+                    fs   = r.get("final_score")
+                    # None -> очень маленькое значение для сортировки
+                    dens_s = -1.0 if dens is None else float(dens)
+                    mean_s = -1e9 if mean is None else float(mean)
+                    fs_s   = -1e9 if fs   is None else float(fs)
+                    return (dens_s, mean_s, fs_s)
+                rows.sort(key=_sort_key, reverse=True)
+
+                # Напечатаем финальный порядок
+                _print_table(
+                    rows,
+                    ["section", "cluster_id", "post_dens_at_tau", "post_topk_mean_sim", "final_score", "topic"],
+                    title="Final candidates order (after post-level rerank)"
+                )
+
         return rows
 
 def fetch_style_and_topic(cluster_id: int, section: str) -> dict:

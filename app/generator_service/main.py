@@ -21,5 +21,5 @@ def generate_post(user_query: str) -> str:
     return out
 
 if __name__ == "__main__":
-    q = " ".join(sys.argv[1:]) or "Напиши пост про популярную породу кошек"
+    q = " ".join(sys.argv[1:]) or "Напиши пост про мейн-кунов"
     print(generate_post(q))
