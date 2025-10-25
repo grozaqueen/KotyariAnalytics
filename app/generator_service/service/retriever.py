@@ -2,6 +2,12 @@ from typing import Any
 import numpy as np
 from .db import get_conn
 
+__all__ = [
+    "select_candidate_clusters",
+    "fetch_style_and_topic",
+    "fetch_exemplars_and_similar",
+]
+
 def _vec_sql(vec: np.ndarray) -> str:
     return "[" + ",".join(f"{float(x):.8f}" for x in vec.tolist()) + "]"
 
@@ -21,7 +27,6 @@ def select_candidate_clusters(q_emb: np.ndarray, topk: int = 8, section: str | N
     q = _vec_sql(q_emb)
     with get_conn() as conn, conn.cursor() as cur:
         mv_ready = _is_matview_populated(conn, "public", "mv_cluster_trend_score")
-
         if mv_ready:
             sql = """
             WITH nn_centroid AS (
@@ -68,7 +73,7 @@ def select_candidate_clusters(q_emb: np.ndarray, topk: int = 8, section: str | N
                 n.cluster_id,
                 n.sim_centroid,
                 1.0 - (ct.title_emb <#> %s::vector) AS sim_title,
-                0::double precision             AS trend_score,
+                0::double precision                 AS trend_score,
                 ct.topic
               FROM nn_centroid n
               JOIN public.cluster_topics_by_section ct
@@ -98,15 +103,17 @@ def fetch_style_and_topic(cluster_id: int, section: str) -> dict:
               cs.avg_len_tokens, cs.p95_len_tokens, cs.emoji_rate, cs.exclam_rate,
               cs.question_rate, cs.markdown_rate, cs.top_ngrams, cs.slang_ngrams,
               ct.topic,
-              COALESCE(ts.trend_score, 0) AS trend_score
+              COALESCE(ts.trend_score, 0) AS trend_score,
+              tp.total_count_30d, tp.top_max_phrase, tp.top_max_count
             FROM public.cluster_style cs
             JOIN public.cluster_topics_by_section ct
               ON ct.cluster_id = cs.cluster_id AND ct.section = cs.section
             LEFT JOIN public.mv_cluster_trend_score ts
               ON ts.section = ct.section AND ts.cluster_id = ct.cluster_id
+            LEFT JOIN public.topic_popularity_wordstat tp
+              ON tp.section = ct.section AND tp.cluster_id = ct.cluster_id
             WHERE cs.cluster_id = %s AND cs.section = %s;
             """
-            cur.execute(sql, (cluster_id, section))
         else:
             sql = """
             SELECT
@@ -115,14 +122,16 @@ def fetch_style_and_topic(cluster_id: int, section: str) -> dict:
               cs.avg_len_tokens, cs.p95_len_tokens, cs.emoji_rate, cs.exclam_rate,
               cs.question_rate, cs.markdown_rate, cs.top_ngrams, cs.slang_ngrams,
               ct.topic,
-              0::double precision AS trend_score
+              0::double precision AS trend_score,
+              tp.total_count_30d, tp.top_max_phrase, tp.top_max_count
             FROM public.cluster_style cs
             JOIN public.cluster_topics_by_section ct
               ON ct.cluster_id = cs.cluster_id AND ct.section = cs.section
+            LEFT JOIN public.topic_popularity_wordstat tp
+              ON tp.section = ct.section AND tp.cluster_id = ct.cluster_id
             WHERE cs.cluster_id = %s AND cs.section = %s;
             """
-            cur.execute(sql, (cluster_id, section))
-
+        cur.execute(sql, (cluster_id, section))
         row = cur.fetchone()
         if not row:
             return {}
