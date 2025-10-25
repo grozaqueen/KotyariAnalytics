@@ -23,6 +23,12 @@ def _is_matview_populated(conn, schema: str, name: str) -> bool:
         row = cur.fetchone()
         return bool(row and row[0])
 
+def _has_pg_trgm(conn) -> bool:
+    sql = "SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_trgm');"
+    with conn.cursor() as cur:
+        cur.execute(sql)
+        return bool(cur.fetchone()[0])
+
 def _print_table(rows: list[dict[str, Any]], cols: list[str], title: str):
     print(f"\n===== {title} =====")
     if not rows:
@@ -33,11 +39,92 @@ def _print_table(rows: list[dict[str, Any]], cols: list[str], title: str):
     print(header)
     print("-" * len(header))
     for r in rows:
-        print(" | ".join(str(r.get(c, "")).ljust(widths[c]) for c in cols))
+        print(" | ".join(str(r.get(c, ""))[:widths[c]].ljust(widths[c]) for c in cols))
     print("=" * len(header))
 
-def _rerank_by_posts(cur, q_vec_sql: str, section: str | None, cluster_ids: list[int],
-                     topk_posts: int = 50, tau: float | None = None) -> dict[int, dict[str, Any]]:
+def _dedup_by_cluster(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen = set()
+    out = []
+    for r in rows:
+        cid = int(r["cluster_id"])
+        if cid not in seen:
+            seen.add(cid)
+            out.append(r)
+    return out
+
+def _nz(v, neg_big: float = -1e12) -> float:
+    return float(v) if v is not None else neg_big
+
+def _fmt(v, nd: int = 3) -> str:
+    if v is None:
+        return "NA"
+    try:
+        fv = float(v)
+        if abs(fv - int(fv)) < 1e-9:
+            return str(int(fv))
+        return f"{fv:.{nd}f}"
+    except Exception:
+        return str(v)
+
+def _rank_sort_key_tuple(row: dict[str, Any]) -> tuple[float, float, float, float, float, float, float, float]:
+    section_lex_boost = 1.0 if row.get("section_lex_hit") else 0.0
+    return (
+        _nz(row.get("lex_hits_count")),
+        section_lex_boost,
+        _nz(row.get("section_match_score")),
+        _nz(row.get("post_hits_at_tau")),
+        _nz(row.get("lex_dens")),
+        _nz(row.get("post_dens_at_tau")),
+        _nz(row.get("post_topk_mean_sim")),
+        _nz(row.get("final_score")),
+    )
+
+def _print_ranking_metrics(rows: list[dict[str, Any]], title: str):
+    materialized = []
+    for r in rows:
+        sk = _rank_sort_key_tuple(r)
+        materialized.append({
+            "section": r.get("section"),
+            "cluster_id": r.get("cluster_id"),
+            "lex_hits_count": _fmt(r.get("lex_hits_count"), 0),
+            "section_lex_hit": _fmt(1 if r.get("section_lex_hit") else 0, 0),
+            "section_match_score": _fmt(r.get("section_match_score")),
+            "post_hits_at_tau": _fmt(r.get("post_hits_at_tau"), 0),
+            "lex_dens": _fmt(r.get("lex_dens")),
+            "post_dens_at_tau": _fmt(r.get("post_dens_at_tau")),
+            "post_topk_mean_sim": _fmt(r.get("post_topk_mean_sim")),
+            "final_score": _fmt(r.get("final_score")),
+            "sort_key": f"({', '.join(_fmt(x) for x in sk)})",
+            "topic": r.get("topic"),
+        })
+    _print_table(
+        materialized,
+        ["section", "cluster_id",
+         "lex_hits_count", "section_lex_hit", "section_match_score",
+         "post_hits_at_tau", "lex_dens", "post_dens_at_tau",
+         "post_topk_mean_sim", "final_score",
+         "sort_key", "topic"],
+        title=title
+    )
+
+def _check_params(sql: str, params: tuple):
+    ph = sql.count("%s")
+    if ph != len(params):
+        print(f"[retriever][WARN] placeholders={ph}, params={len(params)}")
+
+
+def _rerank_by_posts(
+    cur,
+    q_vec_sql: str,
+    section: str | None,
+    cluster_ids: list[int],
+    *,
+    query_text: str | None = None,
+    ts_config: str = "simple",
+    topk_posts: int = 50,
+    tau: float | None = None,
+) -> dict[int, dict[str, Any]]:
+
     if not cluster_ids:
         return {}
 
@@ -45,15 +132,22 @@ def _rerank_by_posts(cur, q_vec_sql: str, section: str | None, cluster_ids: list
     WITH sims AS (
       SELECT
         mc.cluster_id,
+        p.id AS post_id,
         1.0 - (pe.emb <#> %s::vector) AS sim,
         ROW_NUMBER() OVER (
           PARTITION BY mc.cluster_id
           ORDER BY pe.emb <#> %s::vector
         ) AS rn,
-        COUNT(*) OVER (PARTITION BY mc.cluster_id) AS cluster_size
+        COUNT(*) OVER (PARTITION BY mc.cluster_id) AS cluster_size,
+        CASE
+          WHEN %s IS NULL THEN NULL
+          ELSE to_tsvector(%s, COALESCE(p.text_clean, '')) @@ plainto_tsquery(%s, %s)
+        END AS lex_hit
       FROM public.message_clusters mc
+      JOIN public.topics p
+        ON p.id = mc.topic_id
       JOIN public.post_embeddings pe
-        ON pe.post_id = mc.topic_id
+        ON pe.post_id = p.id
       WHERE mc.cluster_id = ANY(%s)
         AND (%s IS NULL OR mc.section = %s)
     )
@@ -61,51 +155,270 @@ def _rerank_by_posts(cur, q_vec_sql: str, section: str | None, cluster_ids: list
       cluster_id,
       MAX(cluster_size) AS cluster_size,
       AVG(sim) FILTER (WHERE rn <= %s) AS post_topk_mean_sim,
-      -- Если tau = NULL, вернём NULL в hits/dens (мягко отключаем пороговую метрику)
       SUM(CASE WHEN %s IS NULL THEN NULL ELSE (sim >= %s)::int END) AS post_hits_at_tau,
       (SUM(CASE WHEN %s IS NULL THEN NULL ELSE (sim >= %s)::int END))::float
-        / NULLIF(MAX(cluster_size), 0) AS post_dens_at_tau
+        / NULLIF(MAX(cluster_size), 0) AS post_dens_at_tau,
+      SUM(CASE WHEN lex_hit IS NULL THEN 0 ELSE lex_hit::int END) AS lex_hits_count,
+      SUM(CASE WHEN lex_hit IS NULL THEN 0 ELSE lex_hit::int END)::float
+        / NULLIF(MAX(cluster_size), 0) AS lex_dens
     FROM sims
     GROUP BY cluster_id;
     """
-    # tau используется 3 раза в запросе
     params = (
         q_vec_sql, q_vec_sql,
+        query_text, ts_config, ts_config, query_text,
         cluster_ids,
         section, section,
         topk_posts,
         tau, tau,
         tau, tau,
     )
+    _check_params(sql, params)
     cur.execute(sql, params)
     cols = [d.name for d in cur.description]
     rows = [dict(zip(cols, r)) for r in cur.fetchall()]
     out: dict[int, dict[str, Any]] = {int(r["cluster_id"]): r for r in rows}
 
-    # Отладочный вывод таблицы
     _print_table(
         rows,
-        ["cluster_id", "cluster_size", "post_topk_mean_sim", "post_hits_at_tau", "post_dens_at_tau"],
-        title=f"Post-level metrics (K={topk_posts}, tau={'NA' if tau is None else tau})"
+        [
+            "cluster_id", "cluster_size",
+            "lex_hits_count", "lex_dens",
+            "post_hits_at_tau", "post_dens_at_tau",
+            "post_topk_mean_sim",
+        ],
+        title=f"Post-level metrics (K={topk_posts}, tau={'NA' if tau is None else tau}, ts_config={ts_config})"
     )
     return out
+
+def _discover_clusters_from_posts(
+    cur,
+    q_vec_sql: str,
+    section: str | None,
+    initial_ids: list[int],
+    *,
+    query_text: str | None = None,
+    ts_config: str = "simple",
+    global_posts_limit: int = 120,
+    tau: float | None = None,
+    max_new_clusters: int = 5,
+) -> list[int]:
+
+    sql = """
+    WITH top_posts AS (
+      SELECT
+        mc.section,
+        mc.cluster_id,
+        1.0 - (pe.emb <#> %s::vector) AS sim,
+        CASE
+          WHEN %s IS NULL THEN NULL
+          ELSE to_tsvector(%s, COALESCE(p.text_clean, '')) @@ plainto_tsquery(%s, %s)
+        END AS lex_hit
+      FROM public.message_clusters mc
+      JOIN public.topics p ON p.id = mc.topic_id
+      JOIN public.post_embeddings pe ON pe.post_id = p.id
+      WHERE (%s IS NULL OR mc.section = %s)
+      ORDER BY pe.emb <#> %s::vector
+      LIMIT %s
+    )
+    SELECT
+      section,
+      cluster_id,
+      COUNT(*) AS hits_in_top,
+      AVG(sim)  AS mean_sim,
+      SUM(CASE WHEN %s IS NULL THEN 0 ELSE lex_hit::int END) AS lex_hits_in_top,
+      SUM(CASE WHEN %s IS NULL THEN NULL ELSE (sim >= %s)::int END) AS sem_hits_in_top
+    FROM top_posts
+    GROUP BY section, cluster_id
+    HAVING NOT (cluster_id = ANY(%s))
+    ORDER BY
+      lex_hits_in_top DESC,
+      sem_hits_in_top DESC NULLS LAST,
+      hits_in_top DESC,
+      mean_sim DESC
+    LIMIT %s;
+    """
+    params = (
+        q_vec_sql,
+        query_text, ts_config, ts_config, query_text,
+        section, section,
+        q_vec_sql, global_posts_limit,
+        query_text,
+        tau, tau,
+        initial_ids,
+        max_new_clusters,
+    )
+    _check_params(sql, params)
+    cur.execute(sql, params)
+    rows = cur.fetchall()
+    new_ids = [int(r[1]) for r in rows]
+
+    _print_table(
+        [
+            {
+                "section": r[0],
+                "cluster_id": int(r[1]),
+                "hits_in_top": r[2],
+                "mean_sim": r[3],
+                "lex_hits_in_top": r[4],
+                "sem_hits_in_top": r[5],
+            }
+            for r in rows
+        ],
+        ["section", "cluster_id", "lex_hits_in_top", "sem_hits_in_top", "hits_in_top", "mean_sim"],
+        title=f"Global top-post discovery by (section, cluster_id) (limit={global_posts_limit}, tau={'NA' if tau is None else tau})"
+    )
+    return new_ids
+
+def _fetch_candidates_for_ids(cur, q_vec_sql: str, section: str | None, cluster_ids: list[int], mv_ready: bool,
+                              query_text: str | None = None, ts_config: str = "simple",
+                              trgm_enabled: bool = True) -> list[dict[str, Any]]:
+
+    if not cluster_ids:
+        return []
+
+    if trgm_enabled:
+        sql = """
+        WITH base AS (
+          SELECT
+            ct.section,
+            cc.cluster_id,
+            1.0 - (cc.centroid <#> %s::vector) AS sim_centroid,
+            1.0 - (ct.title_emb <#> %s::vector) AS sim_title,
+            {trend} AS trend_score,
+            ct.topic,
+            tp.total_count_30d,
+            tp.top_max_phrase,
+            tp.top_max_count,
+            tp.top_requests,
+            tp.associations,
+            CASE
+              WHEN %s IS NULL THEN NULL
+              ELSE to_tsvector(%s, COALESCE(ct.section, '')) @@ plainto_tsquery(%s, %s)
+            END AS section_lex_hit,
+            similarity(lower(ct.section), lower(COALESCE(%s::text,''))) AS section_trgm_sim,
+            (
+              COALESCE(
+                (CASE
+                   WHEN %s IS NULL THEN NULL
+                   ELSE (to_tsvector(%s, COALESCE(ct.section, '')) @@ plainto_tsquery(%s, %s))::int
+                 END), 0
+              )::float * 0.7
+              +
+              similarity(lower(ct.section), lower(COALESCE(%s::text,''))) * 0.3
+            ) AS section_match_score
+          FROM public.cluster_centroids cc
+          JOIN public.cluster_topics_by_section ct
+            ON ct.cluster_id = cc.cluster_id
+          {trend_join}
+          LEFT JOIN public.topic_popularity_wordstat tp
+            ON tp.section = ct.section AND tp.cluster_id = ct.cluster_id
+          WHERE cc.cluster_id = ANY(%s)
+            AND (%s IS NULL OR ct.section = %s)
+        )
+        SELECT *,
+               (0.55*sim_centroid + 0.25*COALESCE(sim_title,0) + 0.20*trend_score) AS final_score
+        FROM base;
+        """.format(
+            trend="COALESCE(ts.trend_score, 0)" if mv_ready else "0::double precision",
+            trend_join=("LEFT JOIN public.mv_cluster_trend_score ts "
+                        "ON ts.section = ct.section AND ts.cluster_id = ct.cluster_id") if mv_ready else ""
+        )
+        params = (
+            q_vec_sql, q_vec_sql,
+            query_text, ts_config, ts_config, query_text,
+            query_text,
+            query_text, ts_config, ts_config, query_text,
+            query_text,
+            cluster_ids, section, section
+        )
+    else:
+        sql = """
+        WITH base AS (
+          SELECT
+            ct.section,
+            cc.cluster_id,
+            1.0 - (cc.centroid <#> %s::vector) AS sim_centroid,
+            1.0 - (ct.title_emb <#> %s::vector) AS sim_title,
+            {trend} AS trend_score,
+            ct.topic,
+            tp.total_count_30d,
+            tp.top_max_phrase,
+            tp.top_max_count,
+            tp.top_requests,
+            tp.associations,
+            CASE
+              WHEN %s IS NULL THEN NULL
+              ELSE to_tsvector(%s, COALESCE(ct.section, '')) @@ plainto_tsquery(%s, %s)
+            END AS section_lex_hit,
+            0.0::double precision AS section_trgm_sim,
+            COALESCE(
+              (CASE
+                 WHEN %s IS NULL THEN NULL
+                 ELSE (to_tsvector(%s, COALESCE(ct.section, '')) @@ plainto_tsquery(%s, %s))::int
+               END), 0
+            )::float AS section_match_score
+          FROM public.cluster_centroids cc
+          JOIN public.cluster_topics_by_section ct
+            ON ct.cluster_id = cc.cluster_id
+          {trend_join}
+          LEFT JOIN public.topic_popularity_wordstat tp
+            ON tp.section = ct.section AND tp.cluster_id = ct.cluster_id
+          WHERE cc.cluster_id = ANY(%s)
+            AND (%s IS NULL OR ct.section = %s)
+        )
+        SELECT *,
+               (0.55*sim_centroid + 0.25*COALESCE(sim_title,0) + 0.20*trend_score) AS final_score
+        FROM base;
+        """.format(
+            trend="COALESCE(ts.trend_score, 0)" if mv_ready else "0::double precision",
+            trend_join=("LEFT JOIN public.mv_cluster_trend_score ts "
+                        "ON ts.section = ct.section AND ts.cluster_id = ct.cluster_id") if mv_ready else ""
+        )
+        params = (
+            q_vec_sql, q_vec_sql,
+            query_text, ts_config, ts_config, query_text,
+            query_text, ts_config, ts_config, query_text,
+            cluster_ids, section, section
+        )
+
+    _check_params(sql, params)
+    cur.execute(sql, params)
+    cols = [d.name for d in cur.description]
+    rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+
+    _print_table(
+        rows,
+        ["section", "cluster_id", "sim_centroid", "sim_title", "trend_score",
+         "section_match_score", "section_trgm_sim", "section_lex_hit",
+         "final_score", "topic"],
+        title=f"Augmented candidates fetched ({len(rows)})"
+    )
+    return rows
 
 def select_candidate_clusters(
     q_emb: np.ndarray,
     topk: int = 8,
     section: str | None = None,
-
+    query_text: str | None = None,
+    ts_config: str = "simple",
     posts_topk: int = 50,
     posts_tau: float | None = None,
     reorder_by_posts: bool = True,
+    enable_global_post_discovery: bool = True,
+    global_posts_limit: int = 120,
+    max_new_clusters: int = 5,
+    final_limit: int = 3,
 ) -> list[dict[str, Any]]:
 
     q = _vec_sql(q_emb)
     with get_conn() as conn, conn.cursor() as cur:
         mv_ready = _is_matview_populated(conn, "public", "mv_cluster_trend_score")
+        trgm_enabled = _has_pg_trgm(conn)
         print(f"[retriever] mv_cluster_trend_score populated: {mv_ready}")
+        print(f"[retriever] pg_trgm enabled: {trgm_enabled}")
 
-        if mv_ready:
+        if trgm_enabled:
             sql = """
             WITH nn_centroid AS (
               SELECT cc.cluster_id,
@@ -120,18 +433,32 @@ def select_candidate_clusters(
                 n.cluster_id,
                 n.sim_centroid,
                 1.0 - (ct.title_emb <#> %s::vector) AS sim_title,
-                COALESCE(ts.trend_score, 0)        AS trend_score,
+                {trend} AS trend_score,
                 ct.topic,
                 tp.total_count_30d,
                 tp.top_max_phrase,
                 tp.top_max_count,
                 tp.top_requests,
-                tp.associations
+                tp.associations,
+                CASE
+                  WHEN %s IS NULL THEN NULL
+                  ELSE to_tsvector(%s, COALESCE(ct.section, '')) @@ plainto_tsquery(%s, %s)
+                END AS section_lex_hit,
+                similarity(lower(ct.section), lower(COALESCE(%s::text,''))) AS section_trgm_sim,
+                (
+                  COALESCE(
+                    (CASE
+                       WHEN %s IS NULL THEN NULL
+                       ELSE (to_tsvector(%s, COALESCE(ct.section, '')) @@ plainto_tsquery(%s, %s))::int
+                     END), 0
+                  )::float * 0.7
+                  +
+                  similarity(lower(ct.section), lower(COALESCE(%s::text,''))) * 0.3
+                ) AS section_match_score
               FROM nn_centroid n
               JOIN public.cluster_topics_by_section ct
                 ON ct.cluster_id = n.cluster_id
-              LEFT JOIN public.mv_cluster_trend_score ts
-                ON ts.section = ct.section AND ts.cluster_id = ct.cluster_id
+              {trend_join}
               LEFT JOIN public.topic_popularity_wordstat tp
                 ON tp.section = ct.section AND tp.cluster_id = ct.cluster_id
               WHERE (%s IS NULL OR ct.section = %s)
@@ -140,9 +467,21 @@ def select_candidate_clusters(
                    (0.55*sim_centroid + 0.25*COALESCE(sim_title,0) + 0.20*trend_score) AS final_score
             FROM joined
             ORDER BY final_score DESC
-            LIMIT 3;
-            """
-            params = (q, q, topk, q, section, section)
+            LIMIT %s;
+            """.format(
+                trend="COALESCE(ts.trend_score, 0)" if mv_ready else "0::double precision",
+                trend_join=("LEFT JOIN public.mv_cluster_trend_score ts "
+                            "ON ts.section = ct.section AND ts.cluster_id = ct.cluster_id") if mv_ready else ""
+            )
+            params = (
+                q, q, topk, q,
+                query_text, ts_config, ts_config, query_text,
+                query_text,
+                query_text, ts_config, ts_config, query_text,
+                query_text,
+                section, section,
+                final_limit
+            )
         else:
             sql = """
             WITH nn_centroid AS (
@@ -158,16 +497,28 @@ def select_candidate_clusters(
                 n.cluster_id,
                 n.sim_centroid,
                 1.0 - (ct.title_emb <#> %s::vector) AS sim_title,
-                0::double precision                 AS trend_score,
+                {trend} AS trend_score,
                 ct.topic,
                 tp.total_count_30d,
                 tp.top_max_phrase,
                 tp.top_max_count,
                 tp.top_requests,
-                tp.associations
+                tp.associations,
+                CASE
+                  WHEN %s IS NULL THEN NULL
+                  ELSE to_tsvector(%s, COALESCE(ct.section, '')) @@ plainto_tsquery(%s, %s)
+                END AS section_lex_hit,
+                0.0::double precision AS section_trgm_sim,
+                COALESCE(
+                  (CASE
+                     WHEN %s IS NULL THEN NULL
+                     ELSE (to_tsvector(%s, COALESCE(ct.section, '')) @@ plainto_tsquery(%s, %s))::int
+                   END), 0
+                )::float AS section_match_score
               FROM nn_centroid n
               JOIN public.cluster_topics_by_section ct
                 ON ct.cluster_id = n.cluster_id
+              {trend_join}
               LEFT JOIN public.topic_popularity_wordstat tp
                 ON tp.section = ct.section AND tp.cluster_id = ct.cluster_id
               WHERE (%s IS NULL OR ct.section = %s)
@@ -176,29 +527,76 @@ def select_candidate_clusters(
                    (0.55*sim_centroid + 0.25*COALESCE(sim_title,0) + 0.20*trend_score) AS final_score
             FROM joined
             ORDER BY final_score DESC
-            LIMIT 3;
-            """
-            params = (q, q, topk, q, section, section)
+            LIMIT %s;
+            """.format(
+                trend="COALESCE(ts.trend_score, 0)" if mv_ready else "0::double precision",
+                trend_join=("LEFT JOIN public.mv_cluster_trend_score ts "
+                            "ON ts.section = ct.section AND ts.cluster_id = ct.cluster_id") if mv_ready else ""
+            )
+            params = (
+                q, q, topk, q,
+                query_text, ts_config, ts_config, query_text,
+                query_text, ts_config, ts_config, query_text,
+                section, section,
+                final_limit
+            )
 
+        _check_params(sql, params)
         cur.execute(sql, params)
         cols = [d.name for d in cur.description]
         rows = [dict(zip(cols, r)) for r in cur.fetchall()]
 
         _print_table(
             rows,
-            ["section", "cluster_id", "sim_centroid", "sim_title", "trend_score", "final_score", "topic"],
-            title=f"Candidate clusters (stage 1, top {min(3, len(rows))})"
+            ["section", "cluster_id", "sim_centroid", "sim_title", "trend_score",
+             "section_match_score", "section_trgm_sim", "section_lex_hit",
+             "final_score", "topic"],
+            title=f"Candidate clusters (stage 1, up to {final_limit})"
         )
 
+        if section is None and rows:
+            locked_section = rows[0]["section"]
+            print(f"[retriever] No 'section' provided. Locking to section='{locked_section}' for post-level checks.")
+            before, rows = len(rows), [r for r in rows if r["section"] == locked_section]
+            print(f"[retriever] Filtered candidates by section='{locked_section}': {before} → {len(rows)}")
+            section = locked_section
+
+        if enable_global_post_discovery and rows:
+            initial_ids = [int(r["cluster_id"]) for r in rows]
+            extra_ids = _discover_clusters_from_posts(
+                cur, q, section, initial_ids,
+                query_text=query_text,
+                ts_config=ts_config,
+                global_posts_limit=global_posts_limit,
+                tau=posts_tau,
+                max_new_clusters=max_new_clusters
+            )
+            if extra_ids:
+                extra_rows = _fetch_candidates_for_ids(cur, q, section, extra_ids, mv_ready,
+                                                       query_text=query_text, ts_config=ts_config,
+                                                       trgm_enabled=trgm_enabled)
+                rows = _dedup_by_cluster(rows + extra_rows)
+                _print_table(
+                    rows,
+                    ["section", "cluster_id", "sim_centroid", "sim_title", "trend_score",
+                     "section_match_score", "section_trgm_sim", "section_lex_hit",
+                     "final_score", "topic"],
+                    title="Candidates after global post discovery (stage 2, section-locked)"
+                )
+
         if rows:
-            cluster_ids = [int(r["cluster_id"]) for r in rows]
+            cluster_ids_union = [int(r["cluster_id"]) for r in rows]
             post_metrics = _rerank_by_posts(
-                cur, q, section, cluster_ids,
+                cur, q, section, cluster_ids_union,
+                query_text=query_text,
+                ts_config=ts_config,
                 topk_posts=posts_topk,
                 tau=posts_tau
             )
             for r in rows:
                 m = post_metrics.get(int(r["cluster_id"])) or {}
+                r["lex_hits_count"]     = m.get("lex_hits_count")
+                r["lex_dens"]           = m.get("lex_dens")
                 r["post_topk_mean_sim"] = m.get("post_topk_mean_sim")
                 r["post_hits_at_tau"]   = m.get("post_hits_at_tau")
                 r["post_dens_at_tau"]   = m.get("post_dens_at_tau")
@@ -206,30 +604,29 @@ def select_candidate_clusters(
 
             _print_table(
                 rows,
-                ["section", "cluster_id", "cluster_size", "post_topk_mean_sim", "post_hits_at_tau", "post_dens_at_tau"],
-                title="Candidates enriched with post-level metrics (stage 2)"
+                ["section", "cluster_id", "cluster_size",
+                 "lex_hits_count", "lex_dens",
+                 "post_hits_at_tau", "post_dens_at_tau",
+                 "post_topk_mean_sim",
+                 "section_match_score", "section_trgm_sim", "section_lex_hit"],
+                title="Candidates enriched with post-level metrics (stage 3, section-locked)"
             )
 
+            _print_ranking_metrics(rows, title="Ranking metrics (pre-sort)")
             if reorder_by_posts:
-                def _sort_key(r):
-                    dens = r.get("post_dens_at_tau")
-                    mean = r.get("post_topk_mean_sim")
-                    fs   = r.get("final_score")
-                    # None -> очень маленькое значение для сортировки
-                    dens_s = -1.0 if dens is None else float(dens)
-                    mean_s = -1e9 if mean is None else float(mean)
-                    fs_s   = -1e9 if fs   is None else float(fs)
-                    return (dens_s, mean_s, fs_s)
-                rows.sort(key=_sort_key, reverse=True)
-
-                # Напечатаем финальный порядок
+                rows.sort(key=_rank_sort_key_tuple, reverse=True)
+                _print_ranking_metrics(rows, title="Ranking metrics (final order)")
                 _print_table(
                     rows,
-                    ["section", "cluster_id", "post_dens_at_tau", "post_topk_mean_sim", "final_score", "topic"],
-                    title="Final candidates order (after post-level rerank)"
+                    ["section", "cluster_id", "lex_hits_count", "section_lex_hit",
+                     "section_match_score", "post_hits_at_tau",
+                     "lex_dens", "post_dens_at_tau", "post_topk_mean_sim",
+                     "final_score", "topic"],
+                    title="Final candidates order (lexical-count + section correlation first)"
                 )
 
-        return rows
+        return rows[:final_limit]
+
 
 def fetch_style_and_topic(cluster_id: int, section: str) -> dict:
     with get_conn() as conn, conn.cursor() as cur:
