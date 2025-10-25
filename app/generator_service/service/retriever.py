@@ -23,10 +23,25 @@ def _is_matview_populated(conn, schema: str, name: str) -> bool:
         row = cur.fetchone()
         return bool(row and row[0])
 
+def _print_table(rows: list[dict[str, Any]], cols: list[str], title: str):
+    print(f"\n===== {title} =====")
+    if not rows:
+        print("(empty)")
+        return
+    widths = {c: max(len(c), *(len(str(r.get(c, ""))) for r in rows)) for c in cols}
+    header = " | ".join(c.ljust(widths[c]) for c in cols)
+    print(header)
+    print("-" * len(header))
+    for r in rows:
+        print(" | ".join(str(r.get(c, "")).ljust(widths[c]) for c in cols))
+    print("=" * len(header))
+
 def select_candidate_clusters(q_emb: np.ndarray, topk: int = 8, section: str | None = None) -> list[dict[str, Any]]:
     q = _vec_sql(q_emb)
     with get_conn() as conn, conn.cursor() as cur:
         mv_ready = _is_matview_populated(conn, "public", "mv_cluster_trend_score")
+        print(f"[retriever] mv_cluster_trend_score populated: {mv_ready}")
+
         if mv_ready:
             sql = """
             WITH nn_centroid AS (
@@ -43,12 +58,19 @@ def select_candidate_clusters(q_emb: np.ndarray, topk: int = 8, section: str | N
                 n.sim_centroid,
                 1.0 - (ct.title_emb <#> %s::vector) AS sim_title,
                 COALESCE(ts.trend_score, 0)        AS trend_score,
-                ct.topic
+                ct.topic,
+                tp.total_count_30d,
+                tp.top_max_phrase,
+                tp.top_max_count,
+                tp.top_requests,
+                tp.associations
               FROM nn_centroid n
               JOIN public.cluster_topics_by_section ct
                 ON ct.cluster_id = n.cluster_id
               LEFT JOIN public.mv_cluster_trend_score ts
                 ON ts.section = ct.section AND ts.cluster_id = ct.cluster_id
+              LEFT JOIN public.topic_popularity_wordstat tp
+                ON tp.section = ct.section AND tp.cluster_id = ct.cluster_id
               WHERE (%s IS NULL OR ct.section = %s)
             )
             SELECT *,
@@ -74,10 +96,17 @@ def select_candidate_clusters(q_emb: np.ndarray, topk: int = 8, section: str | N
                 n.sim_centroid,
                 1.0 - (ct.title_emb <#> %s::vector) AS sim_title,
                 0::double precision                 AS trend_score,
-                ct.topic
+                ct.topic,
+                tp.total_count_30d,
+                tp.top_max_phrase,
+                tp.top_max_count,
+                tp.top_requests,
+                tp.associations
               FROM nn_centroid n
               JOIN public.cluster_topics_by_section ct
                 ON ct.cluster_id = n.cluster_id
+              LEFT JOIN public.topic_popularity_wordstat tp
+                ON tp.section = ct.section AND tp.cluster_id = ct.cluster_id
               WHERE (%s IS NULL OR ct.section = %s)
             )
             SELECT *,
@@ -90,7 +119,14 @@ def select_candidate_clusters(q_emb: np.ndarray, topk: int = 8, section: str | N
 
         cur.execute(sql, params)
         cols = [d.name for d in cur.description]
-        return [dict(zip(cols, r)) for r in cur.fetchall()]
+        rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+
+        _print_table(
+            rows,
+            ["section", "cluster_id", "sim_centroid", "sim_title", "trend_score", "final_score", "topic"],
+            title=f"Candidate clusters (top {min(3, len(rows))})"
+        )
+        return rows
 
 def fetch_style_and_topic(cluster_id: int, section: str) -> dict:
     with get_conn() as conn, conn.cursor() as cur:
@@ -104,7 +140,8 @@ def fetch_style_and_topic(cluster_id: int, section: str) -> dict:
               cs.question_rate, cs.markdown_rate, cs.top_ngrams, cs.slang_ngrams,
               ct.topic,
               COALESCE(ts.trend_score, 0) AS trend_score,
-              tp.total_count_30d, tp.top_max_phrase, tp.top_max_count
+              tp.total_count_30d, tp.top_max_phrase, tp.top_max_count,
+              tp.top_requests, tp.associations
             FROM public.cluster_style cs
             JOIN public.cluster_topics_by_section ct
               ON ct.cluster_id = cs.cluster_id AND ct.section = cs.section
@@ -123,7 +160,8 @@ def fetch_style_and_topic(cluster_id: int, section: str) -> dict:
               cs.question_rate, cs.markdown_rate, cs.top_ngrams, cs.slang_ngrams,
               ct.topic,
               0::double precision AS trend_score,
-              tp.total_count_30d, tp.top_max_phrase, tp.top_max_count
+              tp.total_count_30d, tp.top_max_phrase, tp.top_max_count,
+              tp.top_requests, tp.associations
             FROM public.cluster_style cs
             JOIN public.cluster_topics_by_section ct
               ON ct.cluster_id = cs.cluster_id AND ct.section = cs.section
@@ -134,9 +172,29 @@ def fetch_style_and_topic(cluster_id: int, section: str) -> dict:
         cur.execute(sql, (cluster_id, section))
         row = cur.fetchone()
         if not row:
+            print(f"[retriever] No style/topic for section={section}, cluster_id={cluster_id}")
             return {}
         cols = [d.name for d in cur.description]
-        return dict(zip(cols, row))
+        out = dict(zip(cols, row))
+
+        print("\n===== Chosen cluster style & popularity =====")
+        print(f"section:        {out.get('section')}")
+        print(f"cluster_id:     {out.get('cluster_id')}")
+        print(f"topic:          {out.get('topic')}")
+        print(f"trend_score:    {float(out.get('trend_score') or 0):.3f}")
+        print(f"avg_len_tokens: {out.get('avg_len_tokens')} | p95_len_tokens: {out.get('p95_len_tokens')}")
+        print(f"emoji_rate:     {float(out.get('emoji_rate') or 0):.3f} | "
+              f"exclam_rate: {float(out.get('exclam_rate') or 0):.3f} | "
+              f"question_rate: {float(out.get('question_rate') or 0):.3f}")
+        print(f"markdown_rate:  {float(out.get('markdown_rate') or 0):.3f}")
+        print(f"top_ngrams:     {', '.join((out.get('top_ngrams') or [])[:10])}")
+        print(f"slang_ngrams:   {', '.join((out.get('slang_ngrams') or [])[:10])}")
+        print(f"wordstat total_count_30d: {out.get('total_count_30d')}")
+        print(f"wordstat top_max_phrase:  {out.get('top_max_phrase')}")
+        print(f"wordstat top_max_count:   {out.get('top_max_count')}")
+        print("============================================\n")
+
+        return out
 
 def fetch_exemplars_and_similar(cluster_id: int, section: str, q_emb: np.ndarray, exemplars_k=4, similar_k=8) -> dict:
     q = _vec_sql(q_emb)
@@ -166,4 +224,5 @@ def fetch_exemplars_and_similar(cluster_id: int, section: str, q_emb: np.ndarray
         cols_s = [d.name for d in cur.description]
         similar = [dict(zip(cols_s, r)) for r in cur.fetchall()]
 
+    print(f"[retriever] Exemplars: {len(exemplars)} | Similar to query: {len(similar)}")
     return {"exemplars": exemplars, "similar": similar}
