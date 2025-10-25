@@ -1,26 +1,35 @@
-make migrate
-python -m etl.embeddings.backfill_post_embeddings
-python -m etl.clustering.run_clustering
-python -m etl.topics.build_cluster_topics
-python -m etl.topics.backfill_title_embeddings
-python -m etl.style_profile.build_cluster_style
-python -m etl.wordstat.fetch_wordstat_popularity
-python -m etl.trends.refresh_trend_views
-python -m app.generator_service.main
+### 1) Миграции БД: расширения, таблицы, индексы, материализованные вьюхи.
+####    Запускаем ОДИН раз (или когда меняется схема).
+``` make migrate ```
 
+### 2) Бэкфилл эмбеддингов постов (topics → post_embeddings).
+####    Пройдётся по всем записям без эмбеддингов и досчитает их (SBERT ru).
+``` python -m etl.embeddings.backfill_post_embeddings ```
 
-python etl/embeddings/backfill_post_embeddings.py
+### 3) Кластеризация постов (уменьшение размерности UMAP → HDBSCAN).
+####    Перезапишет public.message_clusters и пересчитает центроиды.
+``` python -m etl.clustering.run_clustering ```
 
-python etl/clustering/run_clustering.py
+### 4) Генерация человекочитаемых тем для кластеров через LLM (Grok).
+####    Заполняет/обновляет public.cluster_topics_by_section.
+``` python -m etl.topics.build_cluster_topics ```
 
-python etl/topics/build_cluster_topics.py
+### 5) Эмбеддинги тем (title_emb) для последующего ретривала по темам.
+####    Обновляет emb в public.cluster_topics_by_section.title_emb.
+``` python -m etl.topics.backfill_title_embeddings ```
 
-python etl/topics/backfill_title_embeddings.py
+### 6) Профиль “стиля” по каждому кластеру (средняя длина, эмодзи, n-граммы, эталоны).
+####    Пишет/апдейтит public.cluster_style (теперь с ключом section+cluster_id).
+``` python -m etl.style_profile.build_cluster_style ```
 
-python etl/style_profile/build_cluster_style.py
+### 7) Популярность тем по Wordstat (трафик, ассоциации, топ-запросы).
+####    Апсертит в public.topic_popularity_wordstat по (section, cluster_id).
+``` python -m etl.wordstat.fetch_wordstat_popularity ```
 
-python etl/wordstat/fetch_wordstat_popularity.py
+### 8) Освежить материализованные вьюхи трендов (recency/score).
+####    Первый запуск — без CONCURRENTLY, далее — CONCURRENTLY.
+``` python -m etl.trends.refresh_trend_views ```
 
-python etl/trends/refresh_trend_views.py
-
-python apps/generator_service/main.py "Напиши пост про ..."
+### 9) Запуск генератора: строит контекст (ретрив), подбирает стиль и примеры, генерирует текст.
+####    Пример запроса ниже: замените на свой.
+``` python -m app.generator_service.main "Напиши пост про популярную породу кошек" ```
