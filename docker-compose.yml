@@ -1,0 +1,80 @@
+name: kotyari-analytics
+
+networks:
+  kotyari-net:
+    name: kotyari-net
+    driver: bridge
+
+volumes:
+  pg_data: {}
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg14
+    container_name: kotyari-postgres
+    environment:
+      POSTGRES_DB: ${DB_NAME}
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB -h 127.0.0.1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks:
+      - kotyari-net
+
+  db-init:
+    image: postgres:14
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./db/migrations:/migrations:ro
+      - ./db/seeds:/seeds:ro
+      - ./docker/db-init.sh:/db-init.sh:ro
+    environment:
+      PGHOST: postgres
+      PGPORT: 5432
+      POSTGRES_DB: ${DB_NAME}
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    entrypoint: ["/bin/bash", "/db-init.sh"]
+    networks:
+      - kotyari-net
+
+
+  analytics:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: kotyari-analytics
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - kotyari-net
+    ports:
+      - "${GRPC_PORT:-50051}:50051"
+    environment:
+      PYTHONPATH: /app:/app/app/grpc_gen
+      GRPC_PORT: ${GRPC_PORT:-50051}
+    entrypoint: ["/bin/bash", "/app/docker/analytics-entrypoint.sh"]
+
+  content-moderation:
+    build:
+      context: ./content_moderation
+    container_name: kotyari-content-moderation
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - kotyari-net
+    ports:
+      - "8088:8088"

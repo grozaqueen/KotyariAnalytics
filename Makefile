@@ -1,22 +1,37 @@
-.PHONY: refresh-trends run-gen run-api
+SHELL := /bin/bash
 
-.PHONY: migrate
 migrate:
-	@set -a; source .env; set +a; \
-	psql -h "$$DB_HOST" -p "$$DB_PORT" -d "$$DB_NAME" -U "$$DB_USER" -v ON_ERROR_STOP=1 -f db/migrations/01_pgvector.sql; \
-	psql -h "$$DB_HOST" -p "$$DB_PORT" -d "$$DB_NAME" -U "$$DB_USER" -v ON_ERROR_STOP=1 -f db/migrations/02_base_schema.sql; \
-	psql -h "$$DB_HOST" -p "$$DB_PORT" -d "$$DB_NAME" -U "$$DB_USER" -v ON_ERROR_STOP=1 -f db/migrations/03_views_trends.sql; \
-	psql -h "$$DB_HOST" -p "$$DB_PORT" -d "$$DB_NAME" -U "$$DB_USER" -v ON_ERROR_STOP=1 -f db/migrations/04_indexes.sql
+	@docker compose run --rm db-init
 
-migrate-one:
-	@set -a; source .env; set +a; \
-	psql -h "$$DB_HOST" -p "$$DB_PORT" -d "$$DB_NAME" -U "$$DB_USER" -v ON_ERROR_STOP=1 -f $(FILE)
+etl-once:
+	@docker compose exec analytics bash -lc '\
+	set -euo pipefail; \
+	echo "[0] DB ping"; \
+	python - <<PY \
+import os, psycopg2; \
+conn=psycopg2.connect(host=os.getenv("DB_HOST","127.0.0.1"),port=int(os.getenv("DB_PORT","5432")),dbname=os.getenv("DB_NAME"),user=os.getenv("DB_USER"),password=os.getenv("DB_PASSWORD")); \
+cur=conn.cursor(); cur.execute("SELECT 1"); print("DB OK:", cur.fetchone()[0]); conn.close() \
+PY \
+	&& echo "[1] embeddings" \
+	&& python -m etl.embeddings.backfill_post_embeddings \
+	&& echo "[2] clustering" \
+	&& python -m etl.clustering.run_clustering \
+	&& echo "[3] topics via LLM" \
+	&& python -m etl.topics.build_cluster_topics \
+	&& echo "[4] title embeddings" \
+	&& python -m etl.topics.backfill_title_embeddings \
+	&& echo "[5] style profile" \
+	&& python -m etl.style_profile.build_cluster_style \
+	&& if [[ -n "$${YANDEX_OAUTH_TOKEN:-}" && -n "$${YANDEX_CLIENT_ID:-}" ]]; then \
+	     echo "[6] wordstat"; \
+	     python -m etl.wordstat.fetch_wordstat_popularity; \
+	   else echo "[6] wordstat — skipped"; fi \
+	&& echo "[7] refresh trend MVs" \
+	&& python -m etl.trends.refresh_trend_views \
+	&& echo "=== ETL DONE ==="'
 
-refresh-trends:
-	python etl/trends/refresh_trend_views.py
-
-run-gen:
-	cd apps/generator_service && python main.py "Напиши пост про оптимизацию бюджета на SMM"
-
-run-api:
-	cd apps/generator_service && uvicorn api:app --reload --port 8080
+grpc-smoke:
+	@docker run --rm --network kotyari-net -v "$$PWD/api/protos:/protos:ro" \
+	  fullstorydev/grpcurl -plaintext -import-path /protos -proto posts/posts.proto \
+	  -d "{\"user_prompt\":\"калининград\",\"profile_prompt\":\"\",\"bot_prompt\":\"\"}" \
+	  analytics:50051 posts.PostsService/GetPost
