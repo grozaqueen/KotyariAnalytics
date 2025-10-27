@@ -33,5 +33,5 @@ PY \
 grpc-smoke:
 	@docker run --rm --network kotyari-net -v "$$PWD/api/protos:/protos:ro" \
 	  fullstorydev/grpcurl -plaintext -import-path /protos -proto posts/posts.proto \
-	  -d "{\"user_prompt\":\"калининград\",\"profile_prompt\":\"\",\"bot_prompt\":\"\"}" \
+	  -d "{\"user_prompt\":\"синдром пандоры кота\",\"profile_prompt\":\"\",\"bot_prompt\":\"\"}" \
 	  analytics:50051 posts.PostsService/GetPost
