@@ -6,6 +6,7 @@ migrate:
 etl-once:
 	docker compose exec analytics bash -c " \
 	set -euo pipefail && \
+	exec > >(tee -a etl.txt) 2>&1 && \
 	echo '[0/1] DB ping' && \
 	curl --proxy 'xray-proxy:8100' -sS https://httpbin.org/ip && \
 	python -c \"import os, psycopg2; conn=psycopg2.connect(host=os.getenv('DB_HOST','127.0.0.1'),port=int(os.getenv('DB_PORT','5432')),dbname=os.getenv('DB_NAME'),user=os.getenv('DB_USER'),password=os.getenv('DB_PASSWORD')); cur=conn.cursor(); cur.execute('SELECT 1'); print('DB OK:', cur.fetchone()[0]); conn.close()\" && \
