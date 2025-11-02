@@ -9,9 +9,8 @@ from openai import OpenAI
 load_dotenv()
 
 XAI_API_KEY = os.getenv("XAI_API_KEY")
-GROK_MODEL = os.getenv("GROK_MODEL")
+GROK_MODEL = os.getenv("GROK_MODEL", "grok-beta")
 
-_HTTP_CLIENT: Optional[httpx.Client] = None
 _GROK_CLIENT: Optional[OpenAI] = None
 
 
@@ -25,37 +24,37 @@ def _is_port_open(host: str, port: int, timeout: float = 0.4) -> bool:
             return False
 
 
-def _detect_proxy_url() -> Optional[str]:
-    if _is_port_open("127.0.0.1", 53425):
-        return "socks5h://127.0.0.1:53425"
-    if _is_port_open("127.0.0.1", 53424):
-        return "http://127.0.0.1:53424"
-    return os.getenv("ALL_PROXY")
-
-
-def _get_http_client() -> httpx.Client:
-    global _HTTP_CLIENT
-    if _HTTP_CLIENT is None:
-        proxy = _detect_proxy_url()
-        _HTTP_CLIENT = httpx.Client(
-            proxy=proxy,
-            timeout=30.0,
-            trust_env=False,
-            follow_redirects=True,
-        )
-    return _HTTP_CLIENT
+def _detect_proxy_url():
+    return "http://xray-proxy:8100"
 
 
 def get_grok_client() -> OpenAI:
     global _GROK_CLIENT
     if _GROK_CLIENT is None:
-        if not XAI_API_KEY:
-            raise RuntimeError("XAI_API_KEY is not set in environment")
+        proxy_url = _detect_proxy_url()
+
+        if not proxy_url:
+            raise RuntimeError(
+                "Grok API недоступен без прокси в вашем регионе. "
+                "Установите VLESS_PROXY_URL или ALL_PROXY в .env, "
+                "или запустите локальный socks5/http прокси на порту 53425/53424/8100."
+            )
+
+        print(f"[grok_client] using proxy: {proxy_url}")
+
+        http_client = httpx.Client(
+            proxy=proxy_url,
+            timeout=40.0,
+            trust_env=False,
+            follow_redirects=True,
+        )
+
         _GROK_CLIENT = OpenAI(
             api_key=XAI_API_KEY,
             base_url="https://api.x.ai/v1",
-            http_client=_get_http_client(),
+            http_client=http_client,
         )
+
     return _GROK_CLIENT
 
 

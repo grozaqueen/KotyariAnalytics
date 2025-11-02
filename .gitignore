@@ -1,0 +1,6 @@
+*.json
+
+*.env
+*.idea
+*.csv
+
