@@ -9,8 +9,20 @@ volumes:
   pg_data: {}
 
 services:
+  xray-proxy:
+    image: teddysun/xray:latest
+    container_name: xray-proxy
+    command: [ "xray", "run", "-c", "/etc/xray/config.json" ]
+    volumes:
+      - ./xray-config.json:/etc/xray/config.json:ro
+    ports:
+      - "8100:8100"
+    restart: unless-stopped
+    networks:
+      - kotyari-net
+
   postgres:
-    image: pgvector/pgvector:pg14
+    image: pgvector/pgvector:pg17
     container_name: kotyari-postgres
     environment:
       POSTGRES_DB: ${DB_NAME}
@@ -29,7 +41,7 @@ services:
       - kotyari-net
 
   db-init:
-    image: postgres:14
+    image: postgres:17
     depends_on:
       postgres:
         condition: service_healthy
@@ -55,6 +67,8 @@ services:
     container_name: kotyari-analytics
     env_file: .env
     depends_on:
+      xray-proxy:
+        condition: service_started
       postgres:
         condition: service_healthy
     networks:
