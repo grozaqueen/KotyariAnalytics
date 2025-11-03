@@ -148,7 +148,7 @@ def build_and_save_topics_for_all_sections():
     try:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT mc.topic_id, mc.section, mc.cluster_id, t.text_clean
+                SELECT mc.topic_id, mc.section, mc.cluster_id, t.text
                 FROM public.message_clusters mc
                 JOIN public.topics t ON t.id = mc.topic_id
                 WHERE mc.cluster_id <> -1
