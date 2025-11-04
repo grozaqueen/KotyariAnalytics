@@ -141,7 +141,7 @@ def _rerank_by_posts(
         COUNT(*) OVER (PARTITION BY mc.cluster_id) AS cluster_size,
         CASE
           WHEN %s IS NULL THEN NULL
-          ELSE to_tsvector(%s, COALESCE(p.text_clean, '')) @@ plainto_tsquery(%s, %s)
+          ELSE to_tsvector(%s, COALESCE(p.text, '')) @@ plainto_tsquery(%s, %s)
         END AS lex_hit
       FROM public.message_clusters mc
       JOIN public.topics p
@@ -212,7 +212,7 @@ def _discover_clusters_from_posts(
         1.0 - (pe.emb <#> %s::vector) AS sim,
         CASE
           WHEN %s IS NULL THEN NULL
-          ELSE to_tsvector(%s, COALESCE(p.text_clean, '')) @@ plainto_tsquery(%s, %s)
+          ELSE to_tsvector(%s, COALESCE(p.text, '')) @@ plainto_tsquery(%s, %s)
         END AS lex_hit
       FROM public.message_clusters mc
       JOIN public.topics p ON p.id = mc.topic_id
@@ -699,7 +699,7 @@ def fetch_style_and_topic(cluster_id: int, section: str) -> dict:
 def fetch_exemplars_and_similar(cluster_id: int, section: str, q_emb: np.ndarray, exemplars_k=4, similar_k=8) -> dict:
     q = _vec_sql(q_emb)
     sql_exemplars = """
-    SELECT p.id, p.text_clean AS text
+    SELECT p.id, p.text AS text
     FROM public.cluster_style cs
     JOIN LATERAL unnest(cs.exemplar_post_ids) AS e(pid) ON TRUE
     JOIN public.topics p ON p.id = e.pid
@@ -707,7 +707,7 @@ def fetch_exemplars_and_similar(cluster_id: int, section: str, q_emb: np.ndarray
     LIMIT %s;
     """
     sql_similar = """
-    SELECT p.id, p.text_clean AS text
+    SELECT p.id, p.text AS text
     FROM public.message_clusters mc
     JOIN public.topics p ON p.id = mc.topic_id
     JOIN public.post_embeddings pe ON pe.post_id = p.id

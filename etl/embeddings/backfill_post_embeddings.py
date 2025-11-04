@@ -17,7 +17,7 @@ def embed(texts: list[str]) -> np.ndarray:
 def main(batch=1000):
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute("""
-            SELECT t.id, t.text_clean
+            SELECT t.id, t.text
             FROM public.topics t
             LEFT JOIN public.post_embeddings pe ON pe.post_id = t.id
             WHERE pe.post_id IS NULL

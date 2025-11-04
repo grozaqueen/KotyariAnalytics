@@ -113,7 +113,7 @@ def smart_keyphrases_for_cluster(cluster_texts: List[str], background_texts: Ite
 def main():
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute("""
-            SELECT mc.section, mc.cluster_id, t.id, t.text_clean, pe.emb::text
+            SELECT mc.section, mc.cluster_id, t.id, t.text, pe.emb::text
             FROM public.message_clusters mc
             JOIN public.topics t ON t.id = mc.topic_id
             JOIN public.post_embeddings pe ON pe.post_id = t.id

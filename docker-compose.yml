@@ -65,6 +65,7 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: kotyari-analytics
+    image: anal-img
     env_file: .env
     depends_on:
       xray-proxy:

@@ -10,4 +10,5 @@ SOCAT_PID=$!
 trap "kill -TERM $SOCAT_PID 2>/dev/null || true" EXIT
 
 echo "[analytics] starting gRPC server..."
-exec python -m app.grpc_server
+exec python -m app.grpc_server 2>&1
+echo "[analytics] started"
