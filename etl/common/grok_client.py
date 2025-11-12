@@ -1,61 +1,183 @@
-import os
-import socket
-from typing import Optional
-
+from typing import Dict, Optional
 import httpx
-from dotenv import load_dotenv
 from openai import OpenAI
+from dataclasses import dataclass
+import threading
 
+from dotenv import load_dotenv
+import os
 load_dotenv()
 
 XAI_API_KEY = os.getenv("XAI_API_KEY")
-GROK_MODEL = os.getenv("GROK_MODEL", "grok-beta")
+GROK_MODEL = os.getenv("GROK_MODEL")
 
-_GROK_CLIENT: Optional[OpenAI] = None
-
-
-def _is_port_open(host: str, port: int, timeout: float = 0.4) -> bool:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.settimeout(timeout)
-        try:
-            s.connect((host, port))
-            return True
-        except OSError:
-            return False
+@dataclass
+class ProxyServerConfig:
+    """Конфигурация прокси сервера"""
+    host: str
+    port: int
 
 
-def _detect_proxy_url():
-    return "http://xray-proxy:8100"
+class ProxyConfig:
+    """Конфигурация прокси с валидацией"""
+
+    def __init__(self, config: Dict):
+        proxy_server = config.get('proxy_server', {})
+        self.proxy_server = ProxyServerConfig(
+            host=proxy_server.get('host', ''),
+            port=proxy_server.get('port', 0)
+        )
+
+    def validate(self) -> None:
+        """Валидация конфигурации прокси"""
+        if not 1 <= self.proxy_server.port <= 65535:
+            raise ValueError(f"Invalid API port: {self.proxy_server.port}")
+
+        if not self.proxy_server.host:
+            raise ValueError("proxy host should be presented in config")
+
+
+class GrokClient:
+    """Клиент для работы с Grok API через прокси (Singleton)"""
+
+    # Константы для Grok API
+    GROK_BASE_URL = "https://api.x.ai/v1"
+    DEFAULT_MODEL = "grok-3-mini"
+    DEFAULT_TIMEOUT = 30.0
+
+    _instance: Optional['GrokClient'] = None
+    _lock = threading.Lock()
+
+    def __new__(cls, *args, **kwargs):
+        """Thread-safe singleton implementation"""
+        if cls._instance is None:
+            with cls._lock:
+                # Double-checked locking
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __init__(
+            self,
+            api_key: str,
+            proxy_config: ProxyConfig,
+            timeout: float = DEFAULT_TIMEOUT,
+            model: str = DEFAULT_MODEL
+    ):
+        """
+        Инициализация клиента Grok с прокси
+
+        Args:
+            api_key: API ключ для Grok
+            proxy_config: Конфигурация прокси
+            timeout: Таймаут запросов в секундах
+            model: Модель по умолчанию
+        """
+        # Проверка, что инициализация выполняется только один раз
+        if hasattr(self, '_initialized'):
+            return
+
+        # Валидация конфигурации
+        proxy_config.validate()
+
+        self.api_key = api_key
+        self.model = model
+        self.proxy_config = proxy_config
+
+        # Формирование URL прокси
+        proxy_url = f"socks5://{proxy_config.proxy_server.host}:{proxy_config.proxy_server.port}"
+
+        # Создание httpx клиента с прокси
+        self._http_client = httpx.Client(
+            proxy=proxy_url,
+            timeout=timeout
+        )
+
+        self._openai_client = OpenAI(
+            api_key=api_key,
+            base_url=self.GROK_BASE_URL,
+            http_client=self._http_client
+        )
+
+        self._initialized = True
+
+    def get_client(self) -> OpenAI:
+        """
+        Возвращает настроенный OpenAI клиент для работы с Grok API
+
+        Returns:
+            OpenAI: Клиент с настроенным прокси и base_url
+        """
+        return self._openai_client
+
+    def close(self):
+        """Закрытие HTTP клиента"""
+        if hasattr(self, '_http_client'):
+            self._http_client.close()
+
+    @classmethod
+    def reset_instance(cls):
+        """Сброс синглтона (полезно для тестирования)"""
+        with cls._lock:
+            if cls._instance is not None:
+                cls._instance.close()
+                cls._instance = None
+
+
+_grok_client_instance: Optional[GrokClient] = None
+_instance_lock = threading.Lock()
+
+
+def initialize_grok_client(
+        api_key: str,
+        proxy_config: ProxyConfig,
+        timeout: float = GrokClient.DEFAULT_TIMEOUT,
+        model: str = GrokClient.DEFAULT_MODEL
+) -> None:
+    """
+    Инициализация глобального экземпляра GrokClient
+
+    Args:
+        api_key: API ключ для Grok
+        proxy_config: Конфигурация прокси
+        timeout: Таймаут запросов в секундах
+        model: Модель по умолчанию
+    """
+    global _grok_client_instance
+
+    with _instance_lock:
+        if _grok_client_instance is None:
+            _grok_client_instance = GrokClient(
+                api_key=api_key,
+                proxy_config=proxy_config,
+                timeout=timeout,
+                model=model
+            )
 
 
 def get_grok_client() -> OpenAI:
-    global _GROK_CLIENT
-    if _GROK_CLIENT is None:
-        proxy_url = _detect_proxy_url()
+    """
+    Возвращает OpenAI клиент из глобального синглтона
 
-        if not proxy_url:
-            raise RuntimeError(
-                "Grok API недоступен без прокси в вашем регионе. "
-                "Установите VLESS_PROXY_URL или ALL_PROXY в .env, "
-                "или запустите локальный socks5/http прокси на порту 53425/53424/8100."
-            )
+    Returns:
+        OpenAI: Настроенный клиент для работы с Grok API
+    """
+    if _grok_client_instance is None:
+        config = {
+            'proxy_server': {
+                'host': 'xray-proxy',
+                'port': 8100
+            }
+        }
 
-        print(f"[grok_client] using proxy: {proxy_url}")
+        proxy_config = ProxyConfig(config)
 
-        http_client = httpx.Client(
-            proxy=proxy_url,
-            timeout=40.0,
-            trust_env=False,
-            follow_redirects=True,
-        )
-
-        _GROK_CLIENT = OpenAI(
+        # Инициализация глобального клиента (выполняется один раз)
+        initialize_grok_client(
             api_key=XAI_API_KEY,
-            base_url="https://api.x.ai/v1",
-            http_client=http_client,
+            proxy_config=proxy_config,
+            timeout=30.0
         )
 
-    return _GROK_CLIENT
+    return _grok_client_instance.get_client()
 
-
-__all__ = ["get_grok_client", "XAI_API_KEY", "GROK_MODEL"]
