@@ -66,12 +66,6 @@ class GrokClient:
     ):
         """
         Инициализация клиента Grok с прокси
-
-        Args:
-            api_key: API ключ для Grok
-            proxy_config: Конфигурация прокси
-            timeout: Таймаут запросов в секундах
-            model: Модель по умолчанию
         """
         # Проверка, что инициализация выполняется только один раз
         if hasattr(self, '_initialized'):
@@ -102,12 +96,6 @@ class GrokClient:
         self._initialized = True
 
     def get_client(self) -> OpenAI:
-        """
-        Возвращает настроенный OpenAI клиент для работы с Grok API
-
-        Returns:
-            OpenAI: Клиент с настроенным прокси и base_url
-        """
         return self._openai_client
 
     def close(self):
@@ -115,9 +103,32 @@ class GrokClient:
         if hasattr(self, '_http_client'):
             self._http_client.close()
 
+    def info(self) -> dict:
+
+        ps = self.proxy_config.proxy_server
+        timeout_repr = repr(self._http_client.timeout) if hasattr(self, "_http_client") else None
+
+        def _mask(key: str) -> str:
+            if not key:
+                return ""
+            if len(key) <= 6:
+                return "***"
+            return key[:4] + "..." + key[-2:]
+
+        return {
+            "base_url": self.GROK_BASE_URL,
+            "model": self.model,
+            "proxy": {
+                "scheme": "socks5",
+                "host": ps.host,
+                "port": ps.port,
+            },
+            "timeout": timeout_repr,
+            "api_key_masked": _mask(self.api_key),
+        }
+
     @classmethod
     def reset_instance(cls):
-        """Сброс синглтона (полезно для тестирования)"""
         with cls._lock:
             if cls._instance is not None:
                 cls._instance.close()
@@ -136,12 +147,6 @@ def initialize_grok_client(
 ) -> None:
     """
     Инициализация глобального экземпляра GrokClient
-
-    Args:
-        api_key: API ключ для Grok
-        proxy_config: Конфигурация прокси
-        timeout: Таймаут запросов в секундах
-        model: Модель по умолчанию
     """
     global _grok_client_instance
 
@@ -158,9 +163,6 @@ def initialize_grok_client(
 def get_grok_client() -> OpenAI:
     """
     Возвращает OpenAI клиент из глобального синглтона
-
-    Returns:
-        OpenAI: Настроенный клиент для работы с Grok API
     """
     if _grok_client_instance is None:
         config = {
@@ -169,15 +171,30 @@ def get_grok_client() -> OpenAI:
                 'port': 8100
             }
         }
-
         proxy_config = ProxyConfig(config)
-
-        # Инициализация глобального клиента (выполняется один раз)
         initialize_grok_client(
             api_key=XAI_API_KEY,
             proxy_config=proxy_config,
-            timeout=30.0
+            timeout=30.0,
+            model=GROK_MODEL or GrokClient.DEFAULT_MODEL
         )
-
     return _grok_client_instance.get_client()
 
+
+# ==== ХЕЛПЕРЫ ДЛЯ ПРОСМОТРА НАСТРОЕК ====
+
+def get_grok_settings() -> Optional[dict]:
+
+    inst = _grok_client_instance
+    if inst is None:
+        return None
+    return inst.info()
+
+
+def get_current_proxy() -> Optional[tuple[str, int]]:
+
+    inst = _grok_client_instance
+    if inst is None:
+        return None
+    ps = inst.proxy_config.proxy_server
+    return ps.host, ps.port

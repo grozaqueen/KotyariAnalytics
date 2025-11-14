@@ -1,7 +1,7 @@
 
 from typing import Optional, List, Dict
 from openai import OpenAI
-from etl.common.grok_client import get_grok_client, GROK_MODEL
+from etl.common.grok_client import get_grok_client, GROK_MODEL, get_current_proxy
 
 _client: Optional[OpenAI] = None
 _DEFAULT_MODEL = GROK_MODEL or "grok-3-mini"
@@ -12,6 +12,7 @@ def _client_singleton() -> OpenAI:
     global _client
     if _client is None:
         _client = get_grok_client()
+    print(get_current_proxy())
     return _client
 
 
