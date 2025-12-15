@@ -4,7 +4,7 @@ from openai import OpenAI
 from etl.common.grok_client import get_grok_client, GROK_MODEL, get_current_proxy
 
 _client: Optional[OpenAI] = None
-_DEFAULT_MODEL = GROK_MODEL or "grok-3-mini"
+_DEFAULT_MODEL = GROK_MODEL or "grok-4-1-fast-reasoning"
 
 
 def _client_singleton() -> OpenAI:

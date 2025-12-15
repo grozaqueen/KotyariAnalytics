@@ -63,7 +63,7 @@ def pick_title(text: str) -> str:
         return ""
 
     first_paragraph = " ".join(paragraphs[0])
-    return first_paragraph
+    return first_paragraph.replace("#", "")
 
 def drop_first_paragraph(text: str) -> str:
     if not text:
@@ -95,7 +95,7 @@ def drop_first_paragraph(text: str) -> str:
 
     body = re.sub(r"\s+", " ", body).strip()
 
-    return body
+    return body.replace("#", "")
 
 def generate_single(req: pb.GetPostRequest) -> pb.GetPostResponse:
     q = build_prompt(req.user_prompt, req.profile_prompt, req.bot_prompt)

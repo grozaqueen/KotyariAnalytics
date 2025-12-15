@@ -40,24 +40,23 @@ services:
     networks:
       - kotyari-net
 
-  db-init:
-    image: postgres:17
-    depends_on:
-      postgres:
-        condition: service_healthy
-    volumes:
-      - ./db/migrations:/migrations:ro
-      - ./db/seeds:/seeds:ro
-      - ./docker/db-init.sh:/db-init.sh:ro
-    environment:
-      PGHOST: postgres
-      PGPORT: 5432
-      POSTGRES_DB: ${DB_NAME}
-      POSTGRES_USER: ${DB_USER}
-      POSTGRES_PASSWORD: ${DB_PASSWORD}
-    entrypoint: ["/bin/bash", "/db-init.sh"]
-    networks:
-      - kotyari-net
+#  db-init:
+#    image: postgres:17
+#    depends_on:
+#      postgres:
+#        condition: service_healthy
+#    volumes:
+#      - ./db/migrations:/migrations:ro
+#      - ./docker/db-init.sh:/db-init.sh:ro
+#    environment:
+#      PGHOST: postgres
+#      PGPORT: 5432
+#      POSTGRES_DB: ${DB_NAME}
+#      POSTGRES_USER: ${DB_USER}
+#      POSTGRES_PASSWORD: ${DB_PASSWORD}
+#    entrypoint: ["/bin/bash", "/db-init.sh"]
+#    networks:
+#      - kotyari-net
 
 
   analytics:
