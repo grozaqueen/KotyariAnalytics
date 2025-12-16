@@ -4,6 +4,8 @@ networks:
   kotyari-net:
     name: kotyari-net
     driver: bridge
+  common-network:
+    external: true
 
 volumes:
   pg_data: {}
@@ -20,6 +22,7 @@ services:
     restart: unless-stopped
     networks:
       - kotyari-net
+      - common-network
 
   postgres:
     image: pgvector/pgvector:pg17
@@ -72,6 +75,7 @@ services:
         condition: service_healthy
     networks:
       - kotyari-net
+      - common-network
     ports:
       - "${GRPC_PORT:-50051}:50051"
     environment:
