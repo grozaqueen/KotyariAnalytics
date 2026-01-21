@@ -100,7 +100,7 @@ def drop_first_paragraph(text: str) -> str:
 def generate_single(req: pb.GetPostRequest) -> pb.GetPostResponse:
     q = build_prompt(req.user_prompt, req.profile_prompt, req.bot_prompt)
     if not q:
-        return pb.GetPostResponse(post_title="", post_text="")
+        return pb.GetPostResponse(post_title="Не удалось сгенерировать", post_text="Не удалось сгенерировать")
 
     text: str | None = None
 
@@ -108,15 +108,23 @@ def generate_single(req: pb.GetPostRequest) -> pb.GetPostResponse:
         try:
             text = generate_post(q)
         except Exception as e:
-            print(f"[generator_fn] error: {e}")
+            text = f"Не удалось сгенерировать\nНе удалось сгенерировать"
 
-    if text is None:
-        text = generate_post_via_cli(q)
+    # if text is None:
+    #     text = generate_post_via_cli(q)
+    if text is None or not text.strip():
+        text = f"Не удалось сгенерировать\nНе удалось сгенерировать"
 
-    if text is None:
-        text = f"(stub) Generated for:\n{q}"
+    title = pick_title(text)
+    text_post = drop_first_paragraph(text)
 
-    return pb.GetPostResponse(post_title=pick_title(text), post_text=drop_first_paragraph(text))
+    if not title or not title.strip():
+        title = "Не удалось сгенерировать"
+
+    if not text_post or not text_post.strip():
+        text_post = "Не удалось сгенерировать"
+
+    return pb.GetPostResponse(post_title=title, post_text=text_post)
 
 class PostsService(pb_grpc.PostsServiceServicer):
     async def GetPost(self, request, context):
