@@ -4,7 +4,7 @@ networks:
   kotyari-net:
     name: kotyari-net
     driver: bridge
-  common-network:
+  public-gateway-network:
     external: true
 
 volumes:
@@ -75,7 +75,7 @@ services:
         condition: service_healthy
     networks:
       - kotyari-net
-      - common-network
+      - public-gateway-network
     ports:
       - "${GRPC_PORT:-50051}:50051"
     environment:
