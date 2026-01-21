@@ -22,7 +22,6 @@ services:
     restart: unless-stopped
     networks:
       - kotyari-net
-      - common-network
 
   postgres:
     image: pgvector/pgvector:pg17
